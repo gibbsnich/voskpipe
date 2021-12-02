@@ -14,5 +14,10 @@
     <string name="stop_file">Stop File</string>
     <string name="pause">Pause</string>
     <string name="continueRecognition">Continue</string>
+    <string name="content_language_key">content_language</string>
+    <string name="recaptcha_cookies_key">recaptcha_cookies_key</string>
+    <string name="recaptcha_done_button">Fertig</string>
+    <string name="title_activity_recaptcha">reCAPTCHA-Aufgabe</string>
+    <string name="subtitle_activity_recaptcha">„Fertig“ drücken, wenn es gelöst wurde</string>
 
 </resources>

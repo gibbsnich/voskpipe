@@ -17,12 +17,25 @@ package org.vosk.demo;
 import android.Manifest;
 import android.app.Activity;
 import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.StrictMode;
 import android.text.method.ScrollingMovementMethod;
 import android.widget.Button;
 import android.widget.TextView;
 import android.widget.ToggleButton;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+import org.schabi.newpipe.extractor.InfoItem;
+import org.schabi.newpipe.extractor.downloader.Downloader;
+import org.schabi.newpipe.extractor.exceptions.ExtractionException;
+import org.schabi.newpipe.extractor.localization.ContentCountry;
+import org.schabi.newpipe.extractor.localization.Localization;
+import org.schabi.newpipe.extractor.search.SearchInfo;
+import org.schabi.newpipe.extractor.stream.AudioStream;
+import org.schabi.newpipe.extractor.stream.StreamInfo;
 import org.vosk.LibVosk;
 import org.vosk.LogLevel;
 import org.vosk.Model;
@@ -34,10 +47,27 @@ import org.vosk.android.StorageService;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.List;
 
 import androidx.annotation.NonNull;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
+
+import org.schabi.newpipe.extractor.NewPipe;
+import org.schabi.newpipe.extractor.StreamingService;
+import org.vosk.demo.util.CacheFactory;
+
+import com.google.android.exoplayer2.C;
+import com.google.android.exoplayer2.DefaultRenderersFactory;
+import com.google.android.exoplayer2.ExoPlayer;
+import com.google.android.exoplayer2.MediaItem;
+import com.google.android.exoplayer2.source.MediaParserExtractorAdapter;
+import com.google.android.exoplayer2.source.MediaSource;
+import com.google.android.exoplayer2.source.MediaSourceFactory;
+import com.google.android.exoplayer2.source.ProgressiveMediaSource;
+import com.google.android.exoplayer2.upstream.DataSource;
+import com.google.android.exoplayer2.upstream.DefaultBandwidthMeter;
+import com.google.android.exoplayer2.upstream.DefaultLoadErrorHandlingPolicy;
 
 public class VoskActivity extends Activity implements
         RecognitionListener {
@@ -56,10 +86,38 @@ public class VoskActivity extends Activity implements
     private SpeechStreamService speechStreamService;
     private TextView resultView;
 
+    private ExoPlayer exoPlayer;
+    private StreamingService ytService;
+
     @Override
     public void onCreate(Bundle state) {
         super.onCreate(state);
         setContentView(R.layout.main);
+
+        // Initialize settings first because others inits can use its values
+        //NewPipeSettings.initSettings(this);
+        NewPipe.init(getDownloader(), new Localization("de"), new ContentCountry("DE"));
+
+        for (final StreamingService s : NewPipe.getServices()) {
+            if (s.getServiceInfo().getName().equals("YouTube")) {
+                ytService = s;
+                break;
+            }
+        }
+
+        cacheDataSourceFactory = new CacheFactory(getApplicationContext(), DownloaderImpl.USER_AGENT, new DefaultBandwidthMeter.Builder(getApplicationContext()).build());
+
+        DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(getApplicationContext());
+        exoPlayer = new ExoPlayer.Builder(/* context= */ this)
+                        .setRenderersFactory(renderersFactory)
+                        .build();
+        exoPlayer.setWakeMode(C.WAKE_MODE_NETWORK);
+        exoPlayer.setHandleAudioBecomingNoisy(true);
+
+        StrictMode.ThreadPolicy policy = new StrictMode.ThreadPolicy.Builder().permitAll().build();
+        StrictMode.setThreadPolicy(policy);
+
+        //play("weihnachtsbäckerei");
 
         // Setup layout
         resultView = findViewById(R.id.result_text);
@@ -80,8 +138,84 @@ public class VoskActivity extends Activity implements
         }
     }
 
+    private void play(String s) {
+        if (ytService == null)
+            return;
+
+        try {
+            int ytServiceId = ytService.getServiceId();
+            SearchInfo searchInfo = SearchInfo.getInfo(NewPipe.getService(ytServiceId),
+                    NewPipe.getService(ytServiceId).getSearchQHFactory().fromQuery(s));
+            List<InfoItem> infoItems = searchInfo.getRelatedItems();
+            if (infoItems.size() == 0)
+                return;
+
+            StreamInfo streamInfo = StreamInfo.getInfo(infoItems.get(0).getUrl());
+            List<AudioStream> audioStreams = streamInfo.getAudioStreams();
+            AudioStream selectedAudioStream = null;
+            for (AudioStream audioStream : audioStreams) {
+                if (audioStream.getCodec().equals("opus")) {
+                    if (selectedAudioStream != null) {
+                        if (audioStream.getAverageBitrate() > selectedAudioStream.getAverageBitrate()) {
+                            selectedAudioStream = audioStream;
+                        }
+                    } else {
+                        selectedAudioStream = audioStream;
+                    }
+                }
+            }
+            final Uri uri = Uri.parse(selectedAudioStream.getUrl());
+            final String cacheKey = selectedAudioStream.getUrl() + selectedAudioStream.getAverageBitrate() + selectedAudioStream.getCodec();
+            final MediaSourceFactory factory = getExtractorMediaSourceFactory();
+            final MediaSource mediaSource = factory.createMediaSource(
+                    new MediaItem.Builder()
+                            .setUri(uri)
+                            .setCustomCacheKey(cacheKey)
+                            .build()
+            );
+            exoPlayer.setMediaSource(mediaSource);
+            exoPlayer.prepare();
+            exoPlayer.setPlayWhenReady(true);
+        } catch (ExtractionException | IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private static final int EXTRACTOR_MINIMUM_RETRY = Integer.MAX_VALUE;
+    private DataSource.Factory cacheDataSourceFactory;
+
+    public ProgressiveMediaSource.Factory getExtractorMediaSourceFactory() {
+        final ProgressiveMediaSource.Factory factory;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            factory = new ProgressiveMediaSource.Factory(
+                    cacheDataSourceFactory,
+                    MediaParserExtractorAdapter.FACTORY
+            );
+        } else {
+            factory = new ProgressiveMediaSource.Factory(cacheDataSourceFactory);
+        }
+
+        return factory.setLoadErrorHandlingPolicy(
+                new DefaultLoadErrorHandlingPolicy(EXTRACTOR_MINIMUM_RETRY));
+    }
+
+    protected Downloader getDownloader() {
+        final DownloaderImpl downloader = DownloaderImpl.init(null);
+        setCookiesToDownloader(downloader);
+        return downloader;
+    }
+
+    protected void setCookiesToDownloader(final DownloaderImpl downloader) {
+//        final SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(
+//                getApplicationContext());
+//        final String key = getApplicationContext().getString(R.string.recaptcha_cookies_key);
+//        downloader.setCookie(ReCaptchaActivity.RECAPTCHA_COOKIES_KEY, prefs.getString(key, null));
+        downloader.setCookie(ReCaptchaActivity.RECAPTCHA_COOKIES_KEY, null);
+        downloader.updateYoutubeRestrictedModeCookies(getApplicationContext());
+    }
+
     private void initModel() {
-        StorageService.unpack(this, "model-en-us", "model",
+        StorageService.unpack(this, "model-de-de", "model",
                 (model) -> {
                     this.model = model;
                     setUiState(STATE_READY);
@@ -120,9 +254,22 @@ public class VoskActivity extends Activity implements
         }
     }
 
+    private final String KEYWORD = "computer";
+
     @Override
     public void onResult(String hypothesis) {
         resultView.append(hypothesis + "\n");
+        try {
+            JSONObject jsonObject = new JSONObject(hypothesis);
+            String text = jsonObject.getString("text");
+            if (text.startsWith(KEYWORD)) {
+                String searchTerm = text.substring(KEYWORD.length());
+                play(searchTerm);
+            }
+        } catch (JSONException e) {
+            e.printStackTrace();
+        }
+
     }
 
     @Override
@@ -136,7 +283,7 @@ public class VoskActivity extends Activity implements
 
     @Override
     public void onPartialResult(String hypothesis) {
-        resultView.append(hypothesis + "\n");
+        //resultView.append(hypothesis + "\n");
     }
 
     @Override
